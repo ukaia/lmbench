@@ -110,12 +110,27 @@ can inspect answers or re-score later.
 `c` connect · `r` run benchmark · `x` cancel · `d` delete highlighted run
 (Results tab) · `q` quit
 
+## Settings
+
+Settings persist in `~/.lmbench/config.json` and are restored on start:
+
+- **endpoint** — saved on every successful connect
+- **auto-unload** — the checkbox under the run button; when on (default),
+  each run starts with `lms unload --all` so only the benchmarked model is
+  resident
+- **theme** — pick one in the command palette (`ctrl+p` → "Change theme");
+  it sticks across restarts
+
+Delete the file to reset. Models currently loaded in memory are marked with
+a green ● in the model list (LM Studio endpoints only), refreshed on connect
+and after each run.
+
 ## Notes
 
-- Before each run the app calls `lms unload --all` (LM Studio's CLI) so only
-  the benchmarked model is resident — no memory contention from other loaded
-  models skewing results. Localhost endpoints only; silently skipped when the
-  CLI isn't installed.
+- Auto-unload runs `lms unload --all` (LM Studio's CLI) before each
+  benchmark so no other resident model skews results through RAM/VRAM
+  contention. Localhost endpoints only; silently skipped when the CLI isn't
+  installed. Toggle it off to benchmark against a deliberately busy server.
 - If JIT model loading is disabled in LM Studio, load the model there first;
   otherwise the first request loads it (absorbed by warmup).
 - A model that streams no tokens (failed load, crashed runtime) shows up as a

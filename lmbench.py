@@ -31,12 +31,14 @@ from statistics import mean
 from urllib.parse import urlparse
 
 import httpx
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import (
     Button,
+    Checkbox,
     DataTable,
     Footer,
     Header,
@@ -50,7 +52,9 @@ from textual.widgets import (
 )
 
 DEFAULT_ENDPOINT = os.environ.get("LMSTUDIO_ENDPOINT", "http://localhost:1234/v1")
-RESULTS_DIR = Path(os.environ.get("LMBENCH_DIR", str(Path.home() / ".lmbench"))) / "results"
+BASE_DIR = Path(os.environ.get("LMBENCH_DIR", str(Path.home() / ".lmbench")))
+RESULTS_DIR = BASE_DIR / "results"
+CONFIG_PATH = BASE_DIR / "config.json"
 # v2: bigger token budgets so reasoning/thinking models can conclude, a harder
 # math task, stricter code tests, and a paragraph-count check for long_form.
 SUITE_VERSION = 2
@@ -250,10 +254,46 @@ class HTTPBenchError(Exception):
 # --------------------------------------------------------------------------
 
 
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(**updates) -> None:
+    cfg = load_config()
+    cfg.update(updates)
+    try:
+        CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2))
+    except OSError:
+        pass
+
+
 async def fetch_models(client: httpx.AsyncClient, endpoint: str) -> list[str]:
     resp = await client.get(f"{endpoint}/models")
     resp.raise_for_status()
     return [m.get("id", "?") for m in resp.json().get("data", [])]
+
+
+async def fetch_loaded_models(client: httpx.AsyncClient, endpoint: str) -> set[str]:
+    """Which models are resident in memory, via LM Studio's native REST API.
+
+    Returns an empty set for servers that don't expose /api/v0/models
+    (Ollama, llama.cpp, ...) — the UI then simply shows no loaded marker.
+    """
+    base = endpoint.rsplit("/v1", 1)[0] if endpoint.endswith("/v1") else endpoint
+    try:
+        resp = await client.get(f"{base}/api/v0/models")
+        resp.raise_for_status()
+        return {
+            m.get("id", "")
+            for m in resp.json().get("data", [])
+            if m.get("state") == "loaded"
+        }
+    except Exception:  # noqa: BLE001 - marker is best-effort
+        return set()
 
 
 def _find_lms() -> str | None:
@@ -697,8 +737,10 @@ class LMBench(App):
 
     def __init__(self) -> None:
         super().__init__()
+        self.config = load_config()
         self.selected_model: str | None = None
         self._bench_running = False
+        self._theme_loaded = False
         self._runs: dict[str, dict] = {}
 
     def compose(self) -> ComposeResult:
@@ -706,17 +748,25 @@ class LMBench(App):
         with TabbedContent(initial="tab-bench"):
             with TabPane("Benchmark", id="tab-bench"):
                 with Horizontal(id="endpoint-row"):
-                    yield Input(value=DEFAULT_ENDPOINT, id="endpoint-input")
+                    yield Input(
+                        value=self.config.get("endpoint", DEFAULT_ENDPOINT),
+                        id="endpoint-input",
+                    )
                     yield Button("Connect", id="connect-btn", variant="primary")
                 yield Static("not connected", id="status-line")
                 with Horizontal(id="bench-body"):
                     with Vertical(id="models-pane"):
-                        yield Label("Models (↑/↓ to pick)")
+                        yield Label("Models (↑/↓ to pick · ● loaded)")
                         yield DataTable(id="models-table")
                     with Vertical(id="run-pane"):
                         with Horizontal(id="run-controls"):
                             yield Button("Run benchmark", id="run-btn", variant="success")
                             yield Button("Cancel", id="cancel-btn", variant="error", disabled=True)
+                        yield Checkbox(
+                            "auto-unload other models before run",
+                            value=bool(self.config.get("auto_unload", True)),
+                            id="unload-check",
+                        )
                         yield ProgressBar(id="bench-progress", show_eta=False)
                         yield Static("idle", id="live-stats")
                         yield RichLog(id="bench-log", markup=True, wrap=True)
@@ -765,7 +815,22 @@ class LMBench(App):
 
         self.refresh_results_table()
         self.refresh_board_table()
+
+        # restore + persist theme (picked via the ctrl+p command palette)
+        self.theme_changed_signal.subscribe(self, self._on_theme_changed)
+        saved_theme = self.config.get("theme")
+        if saved_theme:
+            try:
+                self.theme = saved_theme
+            except Exception:  # noqa: BLE001 - unknown theme name in config
+                pass
+        self._theme_loaded = True
+
         self.action_connect()
+
+    def _on_theme_changed(self, theme) -> None:
+        if self._theme_loaded:
+            save_config(theme=getattr(theme, "name", str(theme)))
 
     # ---------------------------------------------------------------- helpers
 
@@ -844,6 +909,10 @@ class LMBench(App):
     def _endpoint_submitted(self) -> None:
         self.action_connect()
 
+    @on(Checkbox.Changed, "#unload-check")
+    def _unload_toggled(self, event: Checkbox.Changed) -> None:
+        save_config(auto_unload=event.value)
+
     @on(TabbedContent.TabActivated)
     def _tab_activated(self, event: TabbedContent.TabActivated) -> None:
         if event.pane.id == "tab-results":
@@ -869,21 +938,31 @@ class LMBench(App):
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:
                 models = await fetch_models(client, endpoint)
+                loaded = await fetch_loaded_models(client, endpoint)
         except Exception as exc:  # noqa: BLE001
             self._set_status(f"[red]✗ {endpoint} — {str(exc)[:120]}[/red]")
             return
 
+        save_config(endpoint=endpoint)
         chat_models = [m for m in models if "embed" not in m.lower()]
         skipped = len(models) - len(chat_models)
 
+        previous = self.selected_model
         table = self.query_one("#models-table", DataTable)
         table.clear()
         for model in chat_models:
-            table.add_row(model, key=model)
-        if chat_models:
-            self.selected_model = chat_models[0]
-        else:
+            if model in loaded:
+                label = Text.assemble(("● ", "bold green"), model)
+            else:
+                label = Text("  " + model)
+            table.add_row(label, key=model)
+        if not chat_models:
             self.selected_model = None
+        elif previous in chat_models:
+            self.selected_model = previous
+            table.move_cursor(row=chat_models.index(previous))
+        else:
+            self.selected_model = chat_models[0]
 
         note = f" ({skipped} embedding model{'s' if skipped != 1 else ''} hidden)" if skipped else ""
         self._set_status(
@@ -902,11 +981,15 @@ class LMBench(App):
 
         timeout = httpx.Timeout(connect=5.0, read=600.0, write=60.0, pool=60.0)
         try:
+            auto_unload = self.query_one("#unload-check", Checkbox).value
             async with httpx.AsyncClient(timeout=timeout) as client:
                 log.write(f"[b]{model}[/b] — suite v{SUITE_VERSION}, temp 0, seed 42")
-                self._set_live(f"[b]{model}[/b]\nunloading resident models …")
-                unloaded, note = await unload_all_models(endpoint)
-                log.write(f"  {note}" if unloaded else f"  [dim]{note}[/dim]")
+                if auto_unload:
+                    self._set_live(f"[b]{model}[/b]\nunloading resident models …")
+                    unloaded, note = await unload_all_models(endpoint)
+                    log.write(f"  {note}" if unloaded else f"  [dim]{note}[/dim]")
+                else:
+                    log.write("  [dim]auto-unload off — resident models stay loaded[/dim]")
                 self._set_live(f"[b]{model}[/b]\nwarmup (loads model if needed) …")
                 warm = await run_bench_task(client, endpoint, model, WARMUP)
                 progress.advance(1)
@@ -964,6 +1047,7 @@ class LMBench(App):
             )
             self.refresh_results_table()
             self.refresh_board_table()
+            self.connect_worker(endpoint)  # refresh ● loaded markers
         except asyncio.CancelledError:
             log.write("[yellow]benchmark cancelled — nothing saved[/yellow]")
             self._set_live("[yellow]cancelled[/yellow]")
