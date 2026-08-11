@@ -377,7 +377,9 @@ async def _run_stream(
             for choice in obj.get("choices") or []:
                 delta = choice.get("delta") or {}
                 content_piece = delta.get("content") or ""
-                reasoning_piece = delta.get("reasoning_content") or ""
+                # thinking channel: LM Studio uses "reasoning_content" for most
+                # models but "reasoning" for gpt-oss (harmony format)
+                reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning") or ""
                 if content_piece or reasoning_piece:
                     if ttft is None:
                         ttft = time.perf_counter() - t0
