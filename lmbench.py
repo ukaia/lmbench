@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from collections import Counter
@@ -27,6 +28,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
+from urllib.parse import urlparse
 
 import httpx
 from textual import on, work
@@ -242,6 +244,57 @@ async def fetch_models(client: httpx.AsyncClient, endpoint: str) -> list[str]:
     resp = await client.get(f"{endpoint}/models")
     resp.raise_for_status()
     return [m.get("id", "?") for m in resp.json().get("data", [])]
+
+
+def _find_lms() -> str | None:
+    found = shutil.which("lms")
+    if found:
+        return found
+    for candidate in (
+        Path.home() / ".lmstudio" / "bin" / "lms",
+        Path.home() / ".cache" / "lm-studio" / "bin" / "lms",
+    ):
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _is_local_endpoint(endpoint: str) -> bool:
+    host = urlparse(endpoint).hostname or ""
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0")
+
+
+async def unload_all_models(endpoint: str) -> tuple[bool, str]:
+    """Best-effort `lms unload --all` so every benchmark starts memory-clean.
+
+    Only one model resident during a run means no RAM/VRAM contention from
+    previously loaded models skewing the numbers. Skipped for remote
+    endpoints (the CLI only controls the local LM Studio) and when the lms
+    CLI is not installed.
+    """
+    if not _is_local_endpoint(endpoint):
+        return False, "remote endpoint — skipping model unload"
+    lms = _find_lms()
+    if lms is None:
+        return False, "lms CLI not found — skipping model unload"
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            lms, "unload", "--all",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await asyncio.wait_for(proc.communicate(), timeout=30)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+        return False, "lms unload timed out — continuing anyway"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"lms unload failed: {str(exc)[:80]}"
+    if proc.returncode != 0:
+        return False, f"lms unload failed: {err.decode('utf-8', 'replace')[:80]}"
+    return True, "unloaded all models (lms unload --all)"
 
 
 async def _run_stream(
@@ -813,6 +866,9 @@ class LMBench(App):
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 log.write(f"[b]{model}[/b] — suite v{SUITE_VERSION}, temp 0, seed 42")
+                self._set_live(f"[b]{model}[/b]\nunloading resident models …")
+                unloaded, note = await unload_all_models(endpoint)
+                log.write(f"  {note}" if unloaded else f"  [dim]{note}[/dim]")
                 self._set_live(f"[b]{model}[/b]\nwarmup (loads model if needed) …")
                 warm = await run_bench_task(client, endpoint, model, WARMUP)
                 progress.advance(1)

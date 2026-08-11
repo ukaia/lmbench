@@ -99,6 +99,10 @@ can inspect answers or re-score later.
 
 ## Notes
 
+- Before each run the app calls `lms unload --all` (LM Studio's CLI) so only
+  the benchmarked model is resident — no memory contention from other loaded
+  models skewing results. Localhost endpoints only; silently skipped when the
+  CLI isn't installed.
 - If JIT model loading is disabled in LM Studio, load the model there first;
   otherwise the first request loads it (absorbed by warmup).
 - A model that streams no tokens (failed load, crashed runtime) shows up as a
