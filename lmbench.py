@@ -51,7 +51,9 @@ from textual.widgets import (
 
 DEFAULT_ENDPOINT = os.environ.get("LMSTUDIO_ENDPOINT", "http://localhost:1234/v1")
 RESULTS_DIR = Path(os.environ.get("LMBENCH_DIR", str(Path.home() / ".lmbench"))) / "results"
-SUITE_VERSION = 1
+# v2: bigger token budgets so reasoning/thinking models can conclude, a harder
+# math task, stricter code tests, and a paragraph-count check for long_form.
+SUITE_VERSION = 2
 
 # Fixed passage used by the summarization task, so every run processes an
 # identical prompt of a few hundred tokens (exercises prompt processing).
@@ -91,25 +93,27 @@ SCORED: list[BenchTask] = [
     BenchTask(
         "qa_short",
         "Answer in one sentence: why is the sky blue?",
-        64,
+        256,
     ),
     BenchTask(
         "reasoning",
-        "Solve step by step, showing your work: A bookstore sells paperbacks "
-        "for $8 and hardcovers for $19. Maya buys 7 books for $89 total. "
-        "How many hardcovers did she buy?",
-        256,
+        "Solve step by step, showing your work: A cinema sells adult tickets "
+        "for $14, child tickets for $9, and senior tickets for $11. One "
+        "evening it sold three times as many child tickets as senior "
+        "tickets, and 47 tickets in total, for $532. How many adult tickets "
+        "were sold?",
+        2048,
     ),
     BenchTask(
         "code_gen",
         "Write a Python function is_prime(n) with a docstring, then show three "
         "example calls with expected output. Output only code.",
-        256,
+        1024,
     ),
     BenchTask(
         "summarize",
         f"Summarize the following passage in exactly two sentences.\n\n{PASSAGE}",
-        96,
+        384,
     ),
     BenchTask(
         "long_form",
@@ -117,12 +121,12 @@ SCORED: list[BenchTask] = [
         "converts sunlight into chemical energy, covering the light-dependent "
         "reactions, the Calvin cycle, and why the process matters for life on "
         "Earth.",
-        512,
+        1024,
     ),
 ]
 
 
-QUALITY_VERSION = 1
+QUALITY_VERSION = 2
 
 # Reference answers to the scored prompts, written by Claude (Fable 5).
 # Model outputs are compared against these with n-gram F1 similarity as part
@@ -135,15 +139,18 @@ REFERENCES: dict[str, str] = {
         "from every direction in the sky."
     ),
     "reasoning": (
-        "Let p be the number of paperbacks and h the number of hardcovers.\n\n"
-        "Step 1: Two equations. Count: p + h = 7. Cost: 8p + 19h = 89.\n"
-        "Step 2: Substitute p = 7 - h into the cost equation: "
-        "8(7 - h) + 19h = 89.\n"
-        "Step 3: Expand: 56 - 8h + 19h = 89, so 56 + 11h = 89.\n"
-        "Step 4: Solve: 11h = 33, so h = 3.\n"
-        "Step 5: Check: 3 hardcovers = $57, 4 paperbacks = $32, total $89. "
+        "Let a, c, and s be the numbers of adult, child, and senior "
+        "tickets.\n\n"
+        "Step 1: Relations. c = 3s (three times as many child as senior), "
+        "and a + c + s = 47, so a = 47 - 4s.\n"
+        "Step 2: Cost equation: 14a + 9c + 11s = 532.\n"
+        "Step 3: Substitute: 14(47 - 4s) + 9(3s) + 11s = 532, so "
+        "658 - 56s + 27s + 11s = 532.\n"
+        "Step 4: Simplify: 658 - 18s = 532, so 18s = 126 and s = 7.\n"
+        "Step 5: Then c = 3(7) = 21 and a = 47 - 21 - 7 = 19.\n"
+        "Check: 19 x $14 + 21 x $9 + 7 x $11 = $266 + $189 + $77 = $532. "
         "Correct.\n\n"
-        "Maya bought 3 hardcovers."
+        "19 adult tickets were sold."
     ),
     "code_gen": (
         "def is_prime(n):\n"
@@ -207,8 +214,9 @@ REFERENCES: dict[str, str] = {
 }
 
 _PRIME_CASES = [
-    (0, False), (1, False), (2, True), (3, True), (4, False),
-    (9, False), (17, True), (25, False), (97, True), (100, False),
+    (-7, False), (0, False), (1, False), (2, True), (3, True),
+    (4, False), (9, False), (17, True), (25, False), (91, False),
+    (97, True), (121, False), (7919, True), (7921, False), (1000003, True),
 ]
 
 
@@ -225,6 +233,8 @@ class TaskResult:
     total_s: float = 0.0
     tokens_estimated: bool = False
     output: str = ""
+    reasoning_output: str = ""
+    finish_reason: str = ""
     quality: float | None = None
     quality_note: str = ""
 
@@ -305,6 +315,8 @@ async def _run_stream(
     chunk_tokens = 0
     usage: dict | None = None
     pieces: list[str] = []
+    reasoning_pieces: list[str] = []
+    finish_reason = ""
 
     async with client.stream("POST", url, json=payload) as resp:
         if resp.status_code != 200:
@@ -324,13 +336,18 @@ async def _run_stream(
                 usage = obj["usage"]
             for choice in obj.get("choices") or []:
                 delta = choice.get("delta") or {}
-                piece = delta.get("content") or delta.get("reasoning_content") or ""
-                if piece:
+                content_piece = delta.get("content") or ""
+                reasoning_piece = delta.get("reasoning_content") or ""
+                if content_piece or reasoning_piece:
                     if ttft is None:
                         ttft = time.perf_counter() - t0
                     chunk_tokens += 1
-                    if delta.get("content"):
-                        pieces.append(piece)
+                    if content_piece:
+                        pieces.append(content_piece)
+                    else:
+                        reasoning_pieces.append(reasoning_piece)
+                if choice.get("finish_reason"):
+                    finish_reason = choice["finish_reason"]
 
     total = time.perf_counter() - t0
     if ttft is None:
@@ -358,6 +375,8 @@ async def _run_stream(
         total_s=total,
         tokens_estimated=estimated,
         output="".join(pieces),
+        reasoning_output="".join(reasoning_pieces),
+        finish_reason=finish_reason,
     )
 
 
@@ -447,7 +466,7 @@ def _check_qa_short(text: str) -> float:
 
 def _check_reasoning(text: str) -> float:
     t = text.lower()
-    answer = r"\b(?:3|three)\b"
+    answer = r"\b(?:19|nineteen)\b"
     if re.search(answer, t[-300:]):
         return 1.0
     if re.search(answer, t):
@@ -476,7 +495,9 @@ def _check_long_form(text: str) -> float:
         ("oxygen",),
     ]
     hits = sum(1 for alts in concepts if any(a in t for a in alts))
-    return hits / len(concepts)
+    paragraphs = len([p for p in re.split(r"\n\s*\n", text.strip()) if p.strip()])
+    structure = 1.0 if paragraphs == 3 else 0.5 if paragraphs in (2, 4) else 0.2
+    return 0.7 * (hits / len(concepts)) + 0.3 * structure
 
 
 async def _check_code_gen(text: str) -> float:
@@ -526,22 +547,36 @@ _CHECKS = {
 }
 
 
-async def score_output(name: str, raw_text: str) -> tuple[float | None, str]:
+async def _check_and_sim(name: str, ref: str, text: str) -> tuple[float, float]:
+    if name == "code_gen":
+        return await _check_code_gen(text), similarity(ref, _extract_code(text))
+    return _CHECKS[name](text), similarity(ref, text)
+
+
+async def score_output(
+    name: str, raw_text: str, finish_reason: str = "", reasoning_text: str = ""
+) -> tuple[float | None, str]:
     """Return (quality 0-100, note) for a task output, or (None, '') if unscored."""
     ref = REFERENCES.get(name)
     if ref is None:
         return None, ""
     text = _strip_thinking(raw_text)
     if not text:
+        thinking = reasoning_text.strip()
+        if thinking:
+            # Model never emitted a final answer within budget. Score the
+            # chain of thought instead at half credit: solving without
+            # delivering beats being wrong, but delivery matters.
+            check, sim = await _check_and_sim(name, ref, thinking)
+            quality = round(50 * (0.6 * check + 0.4 * sim), 1)
+            return quality, f"answer only in thinking ×0.5 · check {check:.2f} · sim {sim:.2f}"
         return 0.0, "no visible answer"
-    if name == "code_gen":
-        check = await _check_code_gen(text)
-        sim = similarity(ref, _extract_code(text))
-    else:
-        check = _CHECKS[name](text)
-        sim = similarity(ref, text)
+    check, sim = await _check_and_sim(name, ref, text)
     quality = round(100 * (0.6 * check + 0.4 * sim), 1)
-    return quality, f"check {check:.2f} · sim {sim:.2f}"
+    note = f"check {check:.2f} · sim {sim:.2f}"
+    if finish_reason == "length":
+        note += " · truncated at budget"
+    return quality, note
 
 
 def summarize(results: list[TaskResult]) -> dict:
@@ -593,6 +628,8 @@ def load_runs() -> list[dict]:
 def board_rows(runs: list[dict]) -> list[tuple]:
     by_model: dict[str, list[dict]] = {}
     for run in runs:
+        if run.get("version") != SUITE_VERSION:
+            continue  # older suites aren't comparable — rerun to rank
         summary = run.get("summary") or {}
         if summary.get("tasks_ok", 0) == 0:
             continue
@@ -691,8 +728,9 @@ class LMBench(App):
             with TabPane("Leaderboard", id="tab-board"):
                 yield DataTable(id="board-table")
                 yield Static(
-                    "Ranked by average generation tok/s · quality = 0-100 vs "
-                    "reference answers (60% objective checks, 40% n-gram similarity)",
+                    f"Suite v{SUITE_VERSION} runs only · ranked by average generation "
+                    "tok/s · quality = 0-100 vs reference answers (60% objective "
+                    "checks, 40% n-gram similarity)",
                     id="board-note",
                 )
         yield Footer()
@@ -707,7 +745,7 @@ class LMBench(App):
         runs_table.cursor_type = "row"
         runs_table.zebra_stripes = True
         runs_table.add_columns(
-            "date", "model", "gen tok/s", "quality", "ttft ms", "prompt tok/s", "tasks"
+            "date", "model", "suite", "gen tok/s", "quality", "ttft ms", "prompt tok/s", "tasks"
         )
 
         detail_table = self.query_one("#detail-table", DataTable)
@@ -887,7 +925,8 @@ class LMBench(App):
                     result = await run_bench_task(client, endpoint, model, task)
                     if result.ok:
                         result.quality, result.quality_note = await score_output(
-                            task.name, result.output
+                            task.name, result.output,
+                            result.finish_reason, result.reasoning_output,
                         )
                     results.append(result)
                     progress.advance(1)
@@ -944,6 +983,7 @@ class LMBench(App):
             table.add_row(
                 run.get("timestamp", "?")[:16].replace("T", " "),
                 run.get("model", "?"),
+                f"v{run.get('version', '?')}",
                 f"{summary.get('avg_gen_tps', 0):.1f}",
                 fmt_quality(summary.get("avg_quality")),
                 f"{summary.get('avg_ttft_s', 0) * 1000:.0f}",
