@@ -20,7 +20,9 @@ import asyncio
 import json
 import os
 import re
+import sys
 import time
+from collections import Counter
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -118,6 +120,96 @@ SCORED: list[BenchTask] = [
 ]
 
 
+QUALITY_VERSION = 1
+
+# Reference answers to the scored prompts, written by Claude (Fable 5).
+# Model outputs are compared against these with n-gram F1 similarity as part
+# of the quality score.
+REFERENCES: dict[str, str] = {
+    "qa_short": (
+        "The sky looks blue because gas molecules in the atmosphere scatter "
+        "shorter wavelengths of sunlight much more strongly than longer ones "
+        "(Rayleigh scattering), so scattered blue light reaches your eyes "
+        "from every direction in the sky."
+    ),
+    "reasoning": (
+        "Let p be the number of paperbacks and h the number of hardcovers.\n\n"
+        "Step 1: Two equations. Count: p + h = 7. Cost: 8p + 19h = 89.\n"
+        "Step 2: Substitute p = 7 - h into the cost equation: "
+        "8(7 - h) + 19h = 89.\n"
+        "Step 3: Expand: 56 - 8h + 19h = 89, so 56 + 11h = 89.\n"
+        "Step 4: Solve: 11h = 33, so h = 3.\n"
+        "Step 5: Check: 3 hardcovers = $57, 4 paperbacks = $32, total $89. "
+        "Correct.\n\n"
+        "Maya bought 3 hardcovers."
+    ),
+    "code_gen": (
+        "def is_prime(n):\n"
+        '    """Return True if n is a prime number, False otherwise.\n'
+        "\n"
+        "    A prime is an integer greater than 1 whose only positive\n"
+        "    divisors are 1 and itself. Runs in O(sqrt(n)) time.\n"
+        '    """\n'
+        "    if n < 2:\n"
+        "        return False\n"
+        "    if n < 4:\n"
+        "        return True\n"
+        "    if n % 2 == 0:\n"
+        "        return False\n"
+        "    i = 3\n"
+        "    while i * i <= n:\n"
+        "        if n % i == 0:\n"
+        "            return False\n"
+        "        i += 2\n"
+        "    return True\n"
+        "\n"
+        "\n"
+        "print(is_prime(2))   # True\n"
+        "print(is_prime(15))  # False\n"
+        "print(is_prime(97))  # True\n"
+    ),
+    "summarize": (
+        "Timekeeping evolved from sundials and water clocks into mechanical "
+        "clocks whose escapements divided time into equal, countable units, "
+        "with later inventions like the pendulum clock, marine chronometer, "
+        "and pocket watch steadily improving accuracy and portability. These "
+        "advances reorganized society itself, enabling navigation, railway "
+        "schedules, and standardized time zones, and reshaping how people "
+        "structure attention, labor, and daily life."
+    ),
+    "long_form": (
+        "Photosynthesis starts with the light-dependent reactions, which "
+        "take place in the thylakoid membranes of chloroplasts. There, "
+        "pigments such as chlorophyll absorb sunlight, and that captured "
+        "energy is used to split water molecules, releasing oxygen as a "
+        "byproduct. The energized electrons travel down an electron "
+        "transport chain, pumping protons across the membrane; the "
+        "resulting gradient drives ATP synthase to produce ATP, while the "
+        "electrons ultimately reduce NADP+ to NADPH. In this way light "
+        "energy is converted into two portable forms of chemical energy.\n\n"
+        "The second stage, the Calvin cycle, runs in the stroma and does "
+        "not need light directly. Carbon dioxide from the air is fixed onto "
+        "a five-carbon sugar by the enzyme rubisco, and the resulting "
+        "molecules are reduced, using the ATP and NADPH made earlier, into "
+        "three-carbon sugars such as G3P. Most of these are recycled to "
+        "keep the cycle turning, but some are exported to build glucose and "
+        "other carbohydrates that store energy in stable chemical bonds.\n\n"
+        "The process matters because it is the entry point for nearly all "
+        "energy in living systems. Plants, algae, and cyanobacteria form "
+        "the base of food webs, so the sugars made by photosynthesis feed "
+        "almost everything else, directly or indirectly. The oxygen "
+        "released sustains aerobic respiration, and the constant drawdown "
+        "of carbon dioxide shapes Earth's atmosphere and climate; even "
+        "fossil fuels are the stored products of ancient photosynthesis."
+    ),
+}
+
+_PRIME_CASES = [
+    (0, False), (1, False), (2, True), (3, True), (4, False),
+    (9, False), (17, True), (25, False), (97, True), (100, False),
+]
+
+
 @dataclass
 class TaskResult:
     name: str
@@ -130,6 +222,9 @@ class TaskResult:
     completion_tokens: int = 0
     total_s: float = 0.0
     tokens_estimated: bool = False
+    output: str = ""
+    quality: float | None = None
+    quality_note: str = ""
 
 
 class HTTPBenchError(Exception):
@@ -156,6 +251,7 @@ async def _run_stream(
     ttft: float | None = None
     chunk_tokens = 0
     usage: dict | None = None
+    pieces: list[str] = []
 
     async with client.stream("POST", url, json=payload) as resp:
         if resp.status_code != 200:
@@ -180,6 +276,8 @@ async def _run_stream(
                     if ttft is None:
                         ttft = time.perf_counter() - t0
                     chunk_tokens += 1
+                    if delta.get("content"):
+                        pieces.append(piece)
 
     total = time.perf_counter() - t0
     if ttft is None:
@@ -206,6 +304,7 @@ async def _run_stream(
         completion_tokens=int(completion),
         total_s=total,
         tokens_estimated=estimated,
+        output="".join(pieces),
     )
 
 
@@ -245,14 +344,163 @@ async def run_bench_task(
         return TaskResult(name=task.name, ok=False, error=str(exc)[:200])
 
 
+# --------------------------------------------------------------------------
+# Quality scoring: 60% objective per-task checks + 40% n-gram similarity to
+# the bundled reference answers. Deterministic, no LLM judge.
+# --------------------------------------------------------------------------
+
+
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _ngram_f1(ref_tokens: list[str], hyp_tokens: list[str], n: int) -> float:
+    if len(ref_tokens) < n or len(hyp_tokens) < n:
+        return 0.0
+    ref_counts = Counter(tuple(ref_tokens[i:i + n]) for i in range(len(ref_tokens) - n + 1))
+    hyp_counts = Counter(tuple(hyp_tokens[i:i + n]) for i in range(len(hyp_tokens) - n + 1))
+    overlap = sum((ref_counts & hyp_counts).values())
+    if overlap == 0:
+        return 0.0
+    precision = overlap / sum(hyp_counts.values())
+    recall = overlap / sum(ref_counts.values())
+    return 2 * precision * recall / (precision + recall)
+
+
+def similarity(ref: str, hyp: str) -> float:
+    ref_tokens, hyp_tokens = _tokenize(ref), _tokenize(hyp)
+    return 0.5 * _ngram_f1(ref_tokens, hyp_tokens, 1) + 0.5 * _ngram_f1(ref_tokens, hyp_tokens, 2)
+
+
+def _strip_thinking(text: str) -> str:
+    text = re.sub(r"<think(?:ing)?>.*?</think(?:ing)?>", "", text, flags=re.S | re.I)
+    cut = text.lower().find("<think")
+    if cut != -1:  # unclosed thinking block (ran out of tokens)
+        text = text[:cut]
+    return text.strip()
+
+
+def _extract_code(text: str) -> str:
+    blocks = re.findall(r"```(?:python|py)?\s*(.*?)```", text, re.S)
+    return "\n\n".join(b.strip() for b in blocks) if blocks else text.strip()
+
+
+def _check_qa_short(text: str) -> float:
+    t = text.lower()
+    hits = sum(1 for k in ("scatter", "blue", "light") if k in t)
+    bonus = 1 if ("rayleigh" in t or "wavelength" in t) else 0
+    return (hits + bonus) / 4
+
+
+def _check_reasoning(text: str) -> float:
+    t = text.lower()
+    answer = r"\b(?:3|three)\b"
+    if re.search(answer, t[-300:]):
+        return 1.0
+    if re.search(answer, t):
+        return 0.5
+    return 0.0
+
+
+def _check_summarize(text: str) -> float:
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text.strip()) if s.strip()]
+    count = len(sentences)
+    base = {2: 1.0, 3: 0.6}.get(count, 0.3 if 1 <= count <= 5 else 0.0)
+    topical = any(k in text.lower() for k in ("clock", "time"))
+    return base if topical else base * 0.5
+
+
+def _check_long_form(text: str) -> float:
+    t = text.lower()
+    concepts = [
+        ("chlorophyll",),
+        ("light-dependent", "light dependent", "light reactions"),
+        ("calvin",),
+        ("atp",),
+        ("nadph",),
+        ("carbon dioxide", "co2", "co₂"),
+        ("glucose", "sugar"),
+        ("oxygen",),
+    ]
+    hits = sum(1 for alts in concepts if any(a in t for a in alts))
+    return hits / len(concepts)
+
+
+async def _check_code_gen(text: str) -> float:
+    """Run the generated is_prime against fixed unit tests in a subprocess."""
+    code = _extract_code(text)
+    if "def is_prime" not in code:
+        return 0.0
+    harness = (
+        f"{code}\n\n"
+        f"_cases = {_PRIME_CASES!r}\n"
+        "_passed = 0\n"
+        "for _n, _want in _cases:\n"
+        "    try:\n"
+        "        if bool(is_prime(_n)) == _want:\n"
+        "            _passed += 1\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "print('LMBENCH_PASS', _passed, len(_cases))\n"
+    )
+    proc = None
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-I", "-c", harness,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        if proc is not None:
+            proc.kill()
+        return 0.0
+    except Exception:
+        return 0.0
+    for line in reversed(out.decode("utf-8", "replace").splitlines()):
+        if line.startswith("LMBENCH_PASS"):
+            _, passed, total = line.split()
+            return int(passed) / int(total)
+    return 0.0
+
+
+_CHECKS = {
+    "qa_short": _check_qa_short,
+    "reasoning": _check_reasoning,
+    "summarize": _check_summarize,
+    "long_form": _check_long_form,
+}
+
+
+async def score_output(name: str, raw_text: str) -> tuple[float | None, str]:
+    """Return (quality 0-100, note) for a task output, or (None, '') if unscored."""
+    ref = REFERENCES.get(name)
+    if ref is None:
+        return None, ""
+    text = _strip_thinking(raw_text)
+    if not text:
+        return 0.0, "no visible answer"
+    if name == "code_gen":
+        check = await _check_code_gen(text)
+        sim = similarity(ref, _extract_code(text))
+    else:
+        check = _CHECKS[name](text)
+        sim = similarity(ref, text)
+    quality = round(100 * (0.6 * check + 0.4 * sim), 1)
+    return quality, f"check {check:.2f} · sim {sim:.2f}"
+
+
 def summarize(results: list[TaskResult]) -> dict:
     ok = [r for r in results if r.ok]
+    qualities = [r.quality for r in ok if r.quality is not None]
     return {
         "tasks_total": len(results),
         "tasks_ok": len(ok),
         "avg_gen_tps": round(mean([r.gen_tps for r in ok]), 2) if ok else 0.0,
         "avg_ttft_s": round(mean([r.ttft_s for r in ok]), 3) if ok else 0.0,
         "avg_prompt_tps": round(mean([r.prompt_tps for r in ok if r.prompt_tps > 0] or [0.0]), 1),
+        "avg_quality": round(mean(qualities), 1) if qualities else None,
         "total_completion_tokens": sum(r.completion_tokens for r in ok),
     }
 
@@ -264,6 +512,7 @@ def save_run(endpoint: str, model: str, results: list[TaskResult], summary: dict
     path = RESULTS_DIR / f"{ts:%Y%m%d-%H%M%S}_{slug}.json"
     doc = {
         "version": SUITE_VERSION,
+        "quality_version": QUALITY_VERSION,
         "timestamp": ts.isoformat(timespec="seconds"),
         "endpoint": endpoint,
         "model": model,
@@ -300,14 +549,22 @@ def board_rows(runs: list[dict]) -> list[tuple]:
         gens = [r["summary"]["avg_gen_tps"] for r in model_runs]
         ttfts = [r["summary"]["avg_ttft_s"] for r in model_runs]
         ptps = [r["summary"].get("avg_prompt_tps", 0.0) for r in model_runs]
+        quals = [q for r in model_runs if (q := r["summary"].get("avg_quality")) is not None]
+        avg_quality = mean(quals) if quals else None
         last = max(r.get("timestamp", "") for r in model_runs)
-        rows.append((model, len(model_runs), mean(gens), max(gens), mean(ttfts), mean(ptps), last))
+        rows.append(
+            (model, len(model_runs), mean(gens), max(gens), avg_quality, mean(ttfts), mean(ptps), last)
+        )
     rows.sort(key=lambda row: row[2], reverse=True)
     return rows
 
 
 def rank_label(index: int) -> str:
     return {0: "🥇", 1: "🥈", 2: "🥉"}.get(index, f"{index + 1}.")
+
+
+def fmt_quality(quality: float | None) -> str:
+    return "—" if quality is None else f"{quality:.0f}"
 
 
 # --------------------------------------------------------------------------
@@ -381,7 +638,8 @@ class LMBench(App):
             with TabPane("Leaderboard", id="tab-board"):
                 yield DataTable(id="board-table")
                 yield Static(
-                    "Ranked by average generation tok/s across saved runs",
+                    "Ranked by average generation tok/s · quality = 0-100 vs "
+                    "reference answers (60% objective checks, 40% n-gram similarity)",
                     id="board-note",
                 )
         yield Footer()
@@ -395,20 +653,22 @@ class LMBench(App):
         runs_table = self.query_one("#runs-table", DataTable)
         runs_table.cursor_type = "row"
         runs_table.zebra_stripes = True
-        runs_table.add_columns("date", "model", "gen tok/s", "ttft ms", "prompt tok/s", "tasks")
+        runs_table.add_columns(
+            "date", "model", "gen tok/s", "quality", "ttft ms", "prompt tok/s", "tasks"
+        )
 
         detail_table = self.query_one("#detail-table", DataTable)
         detail_table.cursor_type = "row"
         detail_table.zebra_stripes = True
         detail_table.add_columns(
-            "task", "ttft ms", "gen tok/s", "prompt tok/s", "in→out", "time s", "note"
+            "task", "quality", "ttft ms", "gen tok/s", "prompt tok/s", "in→out", "time s", "note"
         )
 
         board_table = self.query_one("#board-table", DataTable)
         board_table.cursor_type = "row"
         board_table.zebra_stripes = True
         board_table.add_columns(
-            "rank", "model", "runs", "avg tok/s", "best tok/s", "avg ttft ms",
+            "rank", "model", "runs", "avg tok/s", "best tok/s", "quality", "avg ttft ms",
             "avg prompt tok/s", "last run",
         )
 
@@ -569,13 +829,21 @@ class LMBench(App):
                         f"(max {task.max_tokens} tok) …"
                     )
                     result = await run_bench_task(client, endpoint, model, task)
+                    if result.ok:
+                        result.quality, result.quality_note = await score_output(
+                            task.name, result.output
+                        )
                     results.append(result)
                     progress.advance(1)
                     if result.ok:
                         est = " [dim](tokens estimated)[/dim]" if result.tokens_estimated else ""
+                        qual = (
+                            f"qual {result.quality:3.0f} · " if result.quality is not None else ""
+                        )
                         log.write(
                             f"  [b]{result.name:<10}[/b] "
                             f"{result.gen_tps:6.1f} tok/s · "
+                            f"{qual}"
                             f"ttft {result.ttft_s * 1000:5.0f} ms · "
                             f"prompt {result.prompt_tps:6.0f} tok/s · "
                             f"{result.prompt_tokens}→{result.completion_tokens}{est}"
@@ -588,11 +856,13 @@ class LMBench(App):
             path = save_run(endpoint, model, results, summary)
             log.write(
                 f"[green]done in {elapsed:.0f}s — avg {summary['avg_gen_tps']:.1f} tok/s, "
+                f"qual {fmt_quality(summary['avg_quality'])}, "
                 f"avg ttft {summary['avg_ttft_s'] * 1000:.0f} ms — saved {path.name}[/green]"
             )
             self._set_live(
                 f"[b]{model}[/b]\n"
                 f"[green]avg {summary['avg_gen_tps']:.1f} tok/s · "
+                f"qual {fmt_quality(summary['avg_quality'])}/100 · "
                 f"ttft {summary['avg_ttft_s'] * 1000:.0f} ms · "
                 f"prompt {summary['avg_prompt_tps']:.0f} tok/s[/green]\n"
                 f"{summary['tasks_ok']}/{summary['tasks_total']} tasks ok · saved"
@@ -619,6 +889,7 @@ class LMBench(App):
                 run.get("timestamp", "?")[:16].replace("T", " "),
                 run.get("model", "?"),
                 f"{summary.get('avg_gen_tps', 0):.1f}",
+                fmt_quality(summary.get("avg_quality")),
                 f"{summary.get('avg_ttft_s', 0) * 1000:.0f}",
                 f"{summary.get('avg_prompt_tps', 0):.0f}",
                 f"{summary.get('tasks_ok', 0)}/{summary.get('tasks_total', 0)}",
@@ -637,19 +908,24 @@ class LMBench(App):
             return
         for task in run.get("tasks", []):
             if task.get("ok"):
-                note = "tokens estimated" if task.get("tokens_estimated") else ""
+                notes = []
+                if task.get("quality_note"):
+                    notes.append(task["quality_note"])
+                if task.get("tokens_estimated"):
+                    notes.append("tokens estimated")
                 table.add_row(
                     task.get("name", "?"),
+                    fmt_quality(task.get("quality")),
                     f"{task.get('ttft_s', 0) * 1000:.0f}",
                     f"{task.get('gen_tps', 0):.1f}",
                     f"{task.get('prompt_tps', 0):.0f}",
                     f"{task.get('prompt_tokens', 0)}→{task.get('completion_tokens', 0)}",
                     f"{task.get('total_s', 0):.1f}",
-                    note,
+                    " · ".join(notes),
                 )
             else:
                 table.add_row(
-                    task.get("name", "?"), "—", "—", "—", "—",
+                    task.get("name", "?"), "—", "—", "—", "—", "—",
                     f"{task.get('total_s', 0):.1f}",
                     f"failed: {task.get('error', '?')[:40]}",
                 )
@@ -658,13 +934,14 @@ class LMBench(App):
         table = self.query_one("#board-table", DataTable)
         table.clear()
         for index, row in enumerate(board_rows(load_runs())):
-            model, run_count, avg_gen, best_gen, avg_ttft, avg_ptps, last = row
+            model, run_count, avg_gen, best_gen, avg_quality, avg_ttft, avg_ptps, last = row
             table.add_row(
                 rank_label(index),
                 model,
                 str(run_count),
                 f"{avg_gen:.1f}",
                 f"{best_gen:.1f}",
+                fmt_quality(avg_quality),
                 f"{avg_ttft * 1000:.0f}",
                 f"{avg_ptps:.0f}",
                 last[:16].replace("T", " "),

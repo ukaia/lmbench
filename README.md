@@ -52,9 +52,32 @@ Per task and per run:
 | **gen tok/s** | decode speed: `(completion_tokens − 1) / time after first token` |
 | **ttft** | time to first streamed token |
 | **prompt tok/s** | prompt processing speed: `prompt_tokens / ttft` |
+| **quality** | 0–100 output-quality score against reference answers (below) |
 
 Token counts come from the server's `usage` field, falling back to counting
 stream chunks (marked *estimated*) on servers that don't report usage.
+
+## Quality score
+
+Each scored task also gets a deterministic, formulaic quality score — no LLM
+judge, so scores are reproducible and comparable across machines:
+
+- **60% objective checks**, per task: the math task must reach the correct
+  answer; the generated `is_prime` is actually executed against 10 fixed unit
+  tests (in a `python -I` subprocess with a 10 s timeout); the essay is
+  checked for coverage of 8 key concepts; the summary for sentence count and
+  topicality; the QA answer for the physically correct keywords.
+- **40% n-gram similarity** (ROUGE-style unigram + bigram F1) to bundled
+  reference answers written by Claude (Fable 5).
+
+`<think>…</think>` blocks from reasoning models are stripped before scoring.
+Treat the number as a sanity signal, not an eval harness: a correct answer
+phrased very differently from the reference scores mid-range on the
+similarity component, and 5 fixed prompts is a small sample. It will reliably
+flag a broken or badly quantized model; it won't rank two good ones
+precisely.
+
+Runs saved before this feature show "—" in the quality columns.
 
 ## Tabs
 
@@ -62,10 +85,12 @@ stream chunks (marked *estimated*) on servers that don't report usage.
    live stats, progress, log
 2. **Results** — every saved run, with a per-task breakdown for the
    highlighted row
-3. **Leaderboard** — models ranked by average gen tok/s across all saved runs
+3. **Leaderboard** — models ranked by average gen tok/s across all saved
+   runs, with quality alongside
 
 Runs are stored as JSON in `~/.lmbench/results/` (override with `LMBENCH_DIR`),
-one self-describing file per run — easy to script against.
+one self-describing file per run — including the full model outputs, so you
+can inspect answers or re-score later.
 
 ## Keys
 
